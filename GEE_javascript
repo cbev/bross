@@ -1,0 +1,1317 @@
+// BROSS- Bangladesh Remote Sensing of Suspended Sediment
+// Written by Claire Beveridge
+// Based on code developed by Matthew Bonnema
+// Original version developed October 2019
+// Latest version updated April 2020
+
+// Export a feature collection- uncomment these lines and update as needed; after running, look in "Tasks" bar to the right
+// Export.table.toDrive({
+//   collection: ee.FeatureCollection([study_area]),
+//   description: 'bross_study_area_reduced',
+//   fileFormat: 'SHP'
+// });
+
+ Map.setCenter(89.790282, 24.065000,9);
+
+// Regression equations
+var L8_SSC='0.104*exp(8.295*(red/green)-1.11)';
+var L5L7_SSC='0.19*exp(3.89*(red/green)+3.06)';
+var M_SSC='0.15*exp(6.32*(red/green)+1.24)';
+
+// Thresholds
+var cloud_thresh = ee.Number(0.3); // min percent of non-cloudy
+var ref_thresh_L5L7= ee.Number(0.4); // for red+blue band
+var ref_thresh_L8= ee.Number(0.4); // for red+blue band
+var ref_thresh_S2= ee.Number(0.9); // for red+blue band
+var ref_thresh_MOD= ee.Number(0.90); // for red+blue band
+var red_thresh= ee.Number(0.4); // for red band
+
+// Soil type layer
+var soil_dataset = ee.Image('OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02');
+var soil_layer = soil_dataset.select('b0'); // b0, b10, b30, b60, b100, b200;
+var soil_palette= ["d5c36b", "b96947", "9d3706", "ae868f", "f86714", "46d143", "368f20", "3e5a14","ffd557","fff72e", "ff5a9d", "ff005b"];
+var soil_names= ['SiCl','SaCl','ClLo', 'SiClLo', 'SaClLo', 'Lo', 'SiLo', 'SaLo', 'Si','LoSa', 'Sa'];
+
+// Define functions
+var filter_images=function(start, end, ROI, sat_option, var_option){
+
+  //****Round Time***************************************************************************
+  var Roundtime = function(img) {
+    var I = ee.Image(img)
+    var time = ee.Number(I.get('system:time_start')).round()
+    return I.set('system:time_start',time)};
+
+  //****Convert Scale of Surface Reflectance Estimates**************************************
+  var Convert_scale = function(img) {
+    var I = ee.Image(img)
+    var correct_scale = I.select(['blue','green','red','nir','swir1','swir2']).multiply(0.0001)
+    return I.addBands(correct_scale,['blue','green','red','nir','swir1','swir2'],true)
+  };
+
+    //****Convert Scale of Surface Reflectance Estimates**************************************
+  var Convert_scaleS2 = function(img) {
+    var I = ee.Image(img)
+    var correct_scale = I.select(['blue','green','red','nir','swir1','swir2']).multiply(0.0001)
+    
+    // Harmonize with landsat 8
+    var blue = correct_scale.select(['blue']).multiply(0.9570).add(0.0003)
+    var green = correct_scale.select(['green']).multiply(1.0304).add(0.0015)    
+    var red = correct_scale.select(['red']).multiply(0.9533).add(0.0041)
+    var nir = correct_scale.select(['nir']).multiply(0.9644).add(0.0077)    
+    var swir1 = correct_scale.select(['swir1']).multiply(0.9522).add(0.0034)
+    var swir2 = correct_scale.select(['swir2']).multiply(0.9711).add(0.0004)
+    
+    I=I.addBands(blue,['blue'],true)
+    I=I.addBands(green,['green'],true)
+    I=I.addBands(red,['red'],true)
+    I=I.addBands(nir,['nir'],true)
+    I=I.addBands(swir1,['swir1'],true)
+    I=I.addBands(swir2,['swir2'],true)
+    
+   return I.addBands(correct_scale,['blue','green','red','nir','swir1','swir2'],true)
+  };
+  
+  //****Calculate Area**********************************************************************
+  var calcArea = function(img) {
+    var I = ee.Image(img)
+    var count = I.reduceRegion({
+      reducer: ee.Reducer.count(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    });
+    var area = ee.Number(count.get('green')).multiply(8100)
+    return I.set('ROI_area',area)
+  };
+
+  //****Define Cloud Masking*************************************************************
+  // function to mask out cloudy pixels.
+  var getCloudsL8 = function(img) {
+    var I = ee.Image(img)
+    var qa = I.select('pixel_qa').int64();
+    var mask=qa.eq(324).or(qa.eq(322)) //pixel qa bands for clear land and clear water;
+              .and(I.select('red').lt(red_thresh)) //  all bands less than 0.3
+              .and(I.select('green').lt(red_thresh)) 
+              .and(I.select('blue').lt(red_thresh)) 
+              .and(I.select('nir').lt(red_thresh)) 
+              .and(I.select('blue').add(I.select('red')).lt(ref_thresh_L8)) // cloud threshold
+
+    mask=mask.rename('clear')
+    var sum = mask.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    });
+    I = I.set("clear_pixels",sum.get('clear'))
+    I = I.addBands(mask.rename('clear_mask'))
+    return I
+  };
+
+  var getCloudsS2 = function(img) {
+    var I = ee.Image(img);
+    var qa = I.select('pixel_qa').int64();// Bits 10 and 11 are clouds and cirrus, respectively.
+    var cloudBitMask = 1 << 10;
+    var cirrusBitMask = 1 << 11;
+    var mask = (I.select('red').lt(red_thresh))
+      .and(I.select('green').lt(red_thresh))
+      .and(I.select('blue').lt(red_thresh))
+      .and(I.select('nir').lt(red_thresh))
+      .and((I.select('red').add(I.select('blue'))).lt(ref_thresh_S2))
+      .and(qa.bitwiseAnd(cloudBitMask).eq(0))
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+    mask=mask.rename('clear');
+    var sum = mask.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: ROI,
+        scale: 90,
+        maxPixels: 6098838800,
+      });
+    I = I.set("clear_pixels",sum.get('clear'))
+    I = I.addBands(mask.rename('clear_mask'))
+    return I
+  };
+
+  var getCloudsL5L7 = function(img) {
+    var I = ee.Image(img);
+    var qa = I.select('pixel_qa');
+    var mask = qa.eq(68).or(qa.eq(66))
+      .and(I.select('red').lt(red_thresh)) // pixel qa bands for clear land and clear water; red less than 0.3
+      .and(I.select('red').lt(red_thresh))
+      .and(I.select('green').lt(red_thresh))
+      .and(I.select('blue').lt(red_thresh))
+      .and(I.select('nir').lt(red_thresh))
+      .and(I.select('blue').add(I.select('red')).lt(ref_thresh_L5L7))
+
+    mask=mask.rename('clear')
+    var sum = mask.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+      });
+    I = I.set("clear_pixels",sum.get('clear'))
+    I = I.addBands(mask.rename('clear_mask'))
+    return I
+    };
+
+   //*** get QA Bits for MODIS
+  var getQABits = function(image, start, end, newName) {
+  // Compute the bits we need to extract.
+  var pattern = 0;
+  for (var i = start; i <= end; i++) {
+     pattern += Math.pow(2, i);
+  }
+  // Return a single band image of the extracted QA bits, giving the band
+  // a new name.
+  return image.select([0], [newName])
+                .bitwiseAnd(pattern)
+                .rightShift(start);};
+
+  var getCloudsM = function(img) {
+    var I = ee.Image(img);
+    var qa = I.select('pixel_qa').int64();
+    var landWaterFlag=getQABits(qa, 3, 5, 'land_water_flag');
+    var shadowFlag=getQABits(qa, 2, 2, 'cloud_shadow_flag');
+    var mask = qa.bitwiseAnd(1 << 10).eq(0) // mask out clouds
+    .and(landWaterFlag.neq(7)) // remove deep ocean
+    .and(shadowFlag.eq(0))// remove cloud shadows
+    
+    mask=mask.rename('clear')
+    var sum = mask.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    });
+    I = I.set("clear_pixels",sum.get('clear'))
+    I = I.addBands(mask.rename('clear_mask'))
+    return I
+  };
+                
+  
+  //****Apply Cloud Masking*************************************************************
+  var maskClouds = function(img) {
+    var I = ee.Image(img);
+    return I.updateMask(I.select('clear_mask'))
+    };
+
+  //****Define Index Calculation*********************************************************
+  var calcIndex = function(img) {
+    var I = ee.Image(img);
+    var MNDWI = I.normalizedDifference(['green','swir1']);
+    MNDWI = MNDWI.rename('MNDWI');
+    var MBSRV = I.select('green').add(I.select('blue'));
+    MBSRV = MBSRV.rename('MBSRV');
+    var MBSRN = I.select('swir1').add(I.select('nir'));
+    MBSRN = MBSRN.rename('MBSRN');
+    var AWEsh = I.select('blue')
+      .add(I.select('green').multiply(2.5))
+      .add(MBSRN).multiply(-1.5)
+      .add(I.select('swir2').multiply(-0.25));
+    AWEsh = AWEsh.rename('AWEsh');
+    I = I.addBands(MNDWI);
+    I = I.addBands(MBSRV);
+    I = I.addBands(MBSRN);
+    I = I.addBands(AWEsh);
+    return I};
+
+  var calcIndexM = function(img) {
+    var I = ee.Image(img);
+    var NDWI=I.normalizedDifference(['red','swir1'])
+    NDWI = NDWI.rename('NDWI');
+    var LSWI=I.normalizedDifference(['nir','swir1'])
+    LSWI = LSWI.rename('LSWI');
+    var MLSWI=((I.select('nir').multiply(-1)).add(1)).subtract(I.select('swir2'))
+          .divide(((I.select('nir').multiply(-1)).add(1)).add(I.select('swir2')))
+    MLSWI=MLSWI.rename('MLSWI');
+    
+    I = I.addBands(NDWI)
+    I = I.addBands(LSWI)
+    I = I.addBands(MLSWI)
+    return I
+  };
+
+  //****Define DSWE water classification ************************************************
+  var WaterTests = function(img) {
+    var I = ee.Image(img);
+    var MNDWI = I.select('MNDWI');
+    var MBSRN = I.select('MBSRN');
+    var MBSRV = I.select('MBSRV');
+    var AWEsh = I.select('AWEsh');
+
+    //MNDWI > 0.0123
+    var Test1 = MNDWI.gt(0.0123);
+    //mbsrv > mbsrn
+    var Test2 = MBSRV.gt(MBSRN);
+    //awesh > 0.0
+    var Test3 = AWEsh.gt(0);
+    //mndwi > -0.5 && SWIR1 < 1000 && NIR < 1500
+    var subTest1 = MNDWI.gt(-0.5);
+    var subTest2 = I.select('swir1').lt(0.1);
+    var subTest3 = I.select('nir').lt(0.15);
+    var Test4 = (subTest1.add(subTest2).add(subTest3)).eq(3)
+    //mndwi > -0.5 && SWIR2 < 1000 && NIR < 2000
+    var subTest4 = MNDWI.gt(-0.5);
+    var subTest5 = I.select('swir2').lt(0.1);
+    var subTest6 = I.select('nir').lt(0.2);
+    var Test5 = (subTest4.add(subTest5).add(subTest6)).eq(3)
+    var TestSum = Test1.add(Test2).add(Test3).add(Test4).add(Test5);
+    var Class1 = TestSum.gte(4);
+    var Class2_1 = TestSum.eq(3);
+    Class1 = Class1.rename('Water')
+    var sum = Class1.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    });
+    I = I.set('water_pixels',sum.get('Water'))
+    return I.addBands(Class1)
+  };
+
+  var WaterTestsM = function(img) {
+    var I = ee.Image(img);
+    var NDWI = I.select('NDWI');
+    var LSWI = I.select('LSWI');
+    var MLSWI = I.select('MLSWI');
+    
+    //Kwak et al. (2013) ranges for permanent water: MLSWI: 0.95-1; LSWI: 0.195-1; NDWI: 0.2-1
+
+    var subTest1 = MLSWI.gte(0.95);
+    var subTest2 = MLSWI.lte(1);
+    var subTest3 = LSWI.gte(0.195);
+    var subTest4 = LSWI.lte(1);
+    var subTest5 = NDWI.gte(0.2);
+    var subTest6 = NDWI.lte(1);
+    var Test = (subTest1.add(subTest2).add(subTest3).add(subTest4).add(subTest5).add(subTest6)).eq(6)
+  
+    Test = Test.rename('Water')
+    var sum = Test.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    });
+    I = I.set('water_pixels',sum.get('Water'))
+    return I.addBands(Test)
+  };
+
+  //****Define Land Masking***************************************************************
+  var maskLand = function(img) {
+    var I = ee.Image(img);
+    var mask = I.select('Water').gt(0)
+    return I.updateMask(mask)
+  };
+
+  //****Define Ratio Between Cloud and Water**********************************************
+  var calc_watercloud_ratio = function(img) {
+    var I = ee.Image(img);
+    var ratio = ee.Number(I.get('clear_pixels')).divide(ee.Number(I.get('water_pixels')))
+    return I.set('water_cloud_ratio',ratio)
+  };
+
+  var calcCloudAreaRatio = function(img) {
+    var I = ee.Image(img)
+    var cloudArea = ee.Number(I.get('clear_pixels')).multiply(8100)
+    return I.set('CloudAreaRatio',cloudArea.divide(I.get('ROI_area')))
+  };
+
+  //*****Calc SSC************************************************************
+  var calcSSCL8=function(img){
+    var I=ee.Image(img)
+    var ssc=I.expression(L8_SSC,
+    {'blue':I.select('blue'), 'green': I.select('green'), 'red': I.select('red'), 'nir': I.select('nir')})
+    ssc=ssc.rename('ssc');
+    I=I.addBands(ssc);
+    return I};
+
+  var calcSSCL5L7=function(img){
+    var I=ee.Image(img)
+    var ssc=I.expression(L5L7_SSC,
+    {'blue':I.select('blue'), 'green': I.select('green'), 'red': I.select('red'), 'nir': I.select('nir')})
+    ssc=ssc.rename('ssc');
+    I=I.addBands(ssc);
+    return I};
+  
+  var calcSSCMOD=function(img){
+    var I=ee.Image(img)
+    var ssc=I.expression(M_SSC,
+    {'blue':I.select('blue'), 'green': I.select('green'), 'red': I.select('red'), 'nir': I.select('nir')})
+    ssc=ssc.rename('ssc');
+    I=I.addBands(ssc);
+    return I};
+
+  var avgSSC= function(img) {
+    var I = ee.Image(img)
+    var temp=I.select('ssc')
+    var avgSSC = temp.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })    
+    return I.set('avgSSC',avgSSC.get('ssc'))
+  };
+  
+   //*****Calc Vis and NIR Reflectance************************************************************
+  var AvgNIR = function(img) {
+    var I = ee.Image(img)
+    var temp = I.select('nir')
+    var avgNIR = temp.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })
+    return I.set('avgNIR',avgNIR.get('nir'))
+  };
+  
+  var AvgRED = function(img) {
+    var I = ee.Image(img)
+    var temp = I.select('red')
+    var avgRED = temp.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })
+    return I.set('avgRED',avgRED.get('red'))
+  };
+
+  var AvgGRN = function(img) {
+    var I = ee.Image(img)
+    var temp = I.select('green')
+    var avgGRN = temp.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })
+    return I.set('avgGRN',avgGRN.get('green'))
+  };
+  
+  var AvgBLU = function(img) {
+    var I = ee.Image(img)
+    var temp = I.select('blue')
+    var avgBLU = temp.reduceRegion({
+      reducer: ee.Reducer.median(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })
+    return I.set('avgBLU',avgBLU.get('blue'))
+  };
+  
+  var AvgBrightness = function(img) {
+    var I = ee.Image(img)
+    var temp = I.select('red')
+    var avgBRT = temp.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: ROI,
+      scale: 90,
+      maxPixels: 6098838800,
+    })
+    return I.set('avgBright',avgBRT.get('red'))};
+  
+  //*****Define coefficients for Landsat harmonization**************************************
+  var coefficients = {
+  etm2oli_ols_not_nir: {
+    itcps: ee.Image.constant([0.0003, 0.0088, 0.0061, 0, 0.0254, 0.0172]),
+    slopes: ee.Image.constant([0.8474, 0.8483, 0.9047, 1, 0.8937, 0.9071])
+    },
+    etm2oli_ols: {
+    itcps: ee.Image.constant([0.0003, 0.0088, 0.0061, 0.0412, 0.0254, 0.0172]),
+    slopes: ee.Image.constant([0.8474, 0.8483, 0.9047, 0.8462, 0.8937, 0.9071])
+    },
+  oli2etm_ols: {
+    itcps: ee.Image.constant([0.0183, 0.0123, 0.0123, 0.0448, 0.0306, 0.0116]),
+    slopes: ee.Image.constant([0.885, 0.9317, 0.9372, 0.8339, 0.8639, 0.9165])
+    },
+      };
+
+  //*****Define function to apply harmonization transformation************************
+  var etm2oli= function (img) {
+    var I = ee.Image(img)
+    var convert = I.select(['blue', 'green', 'red', 'nir', 'swir1', 'swir2'])
+      .multiply(coefficients.etm2oli_ols_not_nir.slopes)
+      .add(coefficients.etm2oli_ols_not_nir.itcps)
+    return I.addBands(convert,['blue', 'green', 'red', 'nir', 'swir1', 'swir2'],true)
+};
+
+  //*****Define Landsat IDs**************************************
+  var Satellite_ID_8=function(img) {
+    return img.set('Satellite_ID',ee.Number(8))};
+
+  var Satellite_ID_7=function(img) {
+    return img.set('Satellite_ID',ee.Number(7))};
+    
+  var Satellite_ID_5=function(img) {
+    return img.set('Satellite_ID',ee.Number(5))};
+  
+  var Satellite_ID_3=function(img) {
+    return img.set('Satellite_ID',ee.Number(3))};
+
+  var Satellite_ID_2=function(img) {
+    return img.set('Satellite_ID',ee.Number(2))};
+
+  //*****Process Landsat 8************************
+  if (var_option=='suspended sediment concentration (SSC)'){
+    if (sat_option=='Landsat 8'){
+    var L8imgs = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR') // get all images in the date range and areas
+      .filterDate(start, end)
+      .filterBounds(study_area);
+    L8imgs = L8imgs.map(Roundtime);
+    L8imgs= L8imgs.select(['B2', 'B3','B4','B5','B6','B7','pixel_qa'],
+      ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+    L8imgs = L8imgs.map(Convert_scale);
+    L8imgs = L8imgs.map(calcArea);
+    L8imgs = L8imgs.map(getCloudsL8);
+    L8imgs=L8imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+    var L8natural = L8imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+    L8imgs = L8imgs.map(maskClouds);
+    L8imgs = L8imgs.map(calcIndex);
+    L8imgs = L8imgs.map(WaterTests);
+    L8imgs = L8imgs.map(maskLand);
+    L8imgs = L8imgs.map(calcCloudAreaRatio);
+    L8imgs = L8imgs.map(calcSSCL8);
+    L8imgs = L8imgs.map(avgSSC);
+    L8imgs=L8imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa','ssc']);
+    var L8imgs_ROI = L8imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+    L8imgs_ROI = L8imgs_ROI.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+      .filter(ee.Filter.gt('water_pixels',0));
+    var combine=L8imgs;
+    var combine_ROI=L8imgs_ROI;  
+    var combine_nat=L8natural;
+    var legend_uncertainty='SSC (+/- 134 mg/L)';
+    } // if sat is L8}
+    
+    else if (sat_option=='Sentinel 2'){
+    var S2imgs = ee.ImageCollection('COPERNICUS/S2_SR') // get all images in the date range and areas
+    .filterDate(start, end)
+    .filterBounds(study_area);
+    S2imgs = S2imgs.map(Roundtime);
+    S2imgs= S2imgs.select(['B2', 'B3','B4','B5','B6','B7','QA60'],
+      ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+    S2imgs = S2imgs.map(Convert_scaleS2);
+    S2imgs = S2imgs.map(calcArea);
+    S2imgs = S2imgs.map(getCloudsS2);
+    S2imgs=S2imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+    var S2natural = S2imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+    S2imgs = S2imgs.map(maskClouds);
+    S2imgs = S2imgs.map(calcIndex);
+    S2imgs = S2imgs.map(WaterTests);
+    S2imgs = S2imgs.map(maskLand);
+    S2imgs = S2imgs.map(calcCloudAreaRatio);
+    S2imgs = S2imgs.map(calcSSCL8);
+    S2imgs = S2imgs.map(avgSSC);
+    S2imgs=S2imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa','ssc']);
+    var S2imgs_ROI = S2imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+    S2imgs_ROI = S2imgs_ROI.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+      .filter(ee.Filter.gt('water_pixels',0));
+    var combine=S2imgs; var combine_ROI=S2imgs_ROI; var combine_nat=S2natural;
+    var legend_uncertainty='SSC (+/- 134 mg/L)';
+    }
+      
+  // Landsat 5 & 7
+    else if (sat_option=='Landsat 5 & 7'){
+      var L7imgs = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+        .filterDate(start, end)
+        .filterBounds(study_area);
+      L7imgs = L7imgs.map(Roundtime);
+      L7imgs=L7imgs.select(['B1', 'B2', 'B3','B4','B5','B7', 'sr_cloud_qa','pixel_qa'],
+        ['blue', 'green', 'red', 'nir', 'swir1','swir2', 'sr_cloud_qa','pixel_qa']);
+      L7imgs = L7imgs.map(Convert_scale);
+      L7imgs = L7imgs.map(etm2oli);
+      L7imgs = L7imgs.map(calcArea);
+      L7imgs = L7imgs.map(getCloudsL5L7);
+      L7imgs=L7imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'sr_cloud_qa','pixel_qa']);
+      var L7natural = L7imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+      L7imgs = L7imgs.map(maskClouds);
+      L7imgs = L7imgs.map(calcIndex);
+      L7imgs = L7imgs.map(WaterTests);
+      L7imgs = L7imgs.map(maskLand);
+      //L7imgs = L7imgs.map(calc_watercloud_ratio);
+      L7imgs = L7imgs.map(calcCloudAreaRatio);
+      L7imgs = L7imgs.map(calcSSCL5L7)
+      L7imgs = L7imgs.map(avgSSC)
+      L7imgs=L7imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa','ssc']);
+      var L7imgs_ROI = L7imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+      L7imgs_ROI = L7imgs_ROI.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+        .filter(ee.Filter.gt('water_pixels',0))
+
+    // Landsat 5
+      var L5imgs = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+        .filterDate(start, end)
+        .filterBounds(study_area);
+      L5imgs = L5imgs.map(Roundtime);
+      L5imgs=L5imgs.select(['B1', 'B2', 'B3','B4','B5','B7', 'sr_cloud_qa','pixel_qa'],
+        ['blue', 'green', 'red', 'nir', 'swir1','swir2', 'sr_cloud_qa','pixel_qa']);
+      L5imgs = L5imgs.map(Convert_scale);
+      L5imgs = L5imgs.map(etm2oli);
+      L5imgs = L5imgs.map(calcArea);
+      L5imgs = L5imgs.map(getCloudsL5L7);
+      var L5natural = L5imgs.select(['nir','red','green','blue', 'pixel_qa']); 
+      L5imgs=L5imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+      L5imgs = L5imgs.map(maskClouds);
+      L5imgs = L5imgs.map(calcIndex);
+      L5imgs = L5imgs.map(WaterTests);
+      L5imgs = L5imgs.map(maskLand);
+      //L5imgs = L5imgs.map(calc_watercloud_ratio);
+      L5imgs = L5imgs.map(calcCloudAreaRatio);
+      L5imgs = L5imgs.map(calcSSCL5L7);
+      L5imgs = L5imgs.map(avgSSC);
+      L5imgs=L5imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa','ssc']);
+      var L5imgs_ROI = L5imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+      L5imgs_ROI = L5imgs_ROI.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+        .filter(ee.Filter.gt('water_pixels',0))
+      
+      var combine=L7imgs.merge(L5imgs);
+      var combine_ROI=L7imgs_ROI.merge(L5imgs_ROI);  
+      var combine_nat=L7natural.merge(L5natural);
+      var legend_uncertainty='SSC (+/- 165 mg/L)';}// if sat is L5/L7
+
+  // MODIS
+    else if (sat_option=='MODIS'){
+          var MODimgs = ee.ImageCollection('MODIS/006/MOD09GA')
+      .filterDate(start, end)
+      .filterBounds(ROI);
+    MODimgs=MODimgs.select(['sur_refl_b03', 'sur_refl_b04','sur_refl_b01','sur_refl_b02','sur_refl_b06','sur_refl_b07','state_1km'],
+      ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+    MODimgs = MODimgs.map(Convert_scale);
+    MODimgs = MODimgs.map(calcArea);
+    MODimgs = MODimgs.map(getCloudsM);
+    var MODimgs_nat = MODimgs.select(['red','nir','blue','green','pixel_qa','clear_mask']);  
+    MODimgs = MODimgs.map(maskClouds);
+    MODimgs = MODimgs.map(calcIndexM);
+    MODimgs = MODimgs.map(WaterTestsM);
+    MODimgs = MODimgs.map(maskLand);
+    MODimgs = MODimgs.map(calc_watercloud_ratio);
+    MODimgs = MODimgs.map(calcCloudAreaRatio);
+    MODimgs = MODimgs.map(calcSSCMOD);
+    MODimgs = MODimgs.map(avgSSC);
+    var MODimgs_ROI = MODimgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+    MODimgs_ROI = MODimgs_ROI.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh))
+      .filter(ee.Filter.gt('water_pixels',0));
+    var combine=MODimgs;var combine_ROI=MODimgs_ROI;var combine_nat=MODimgs_nat;
+    var legend_uncertainty='SSC (+/- 165 mg/L)';}
+     // if sat is MODIS
+  
+    combine_ROI=combine_ROI.sort('system:time_start');
+    combine=combine.sort('system:time_start');
+    combine_nat=combine_nat.sort('system:time_start')
+    
+    var PlotSSCTimeSeries= function (satImgs, satImgs_ROI, satTerrain, ROI){
+  //****Plot Timeseries*********************************************************************
+
+    var time = satImgs_ROI.aggregate_array('system:time_start');
+    var CloudCover = ee.Array(satImgs_ROI.aggregate_array('CLOUD_COVER'));
+    var AverageSSC=ee.Array(satImgs_ROI.aggregate_array('avgSSC'));
+    
+    // Create an image time series chart.
+    var chart = ui.Chart.array.values(AverageSSC,0,time)
+      .setSeriesNames([legend_uncertainty])
+      .setOptions({
+        title: 'Surface Suspended Sediment Concentration (SSC) Time Series',
+        pointSize: 4,
+        hAxis: {'title': 'Date'},
+        vAxis: {'title': 'Surface SSC (mg/L)'},
+        legend: {position: 'top'},
+        lineWidth: 1
+      })
+    
+    // Add the chart to the map.
+    chart.style().set({
+      position: 'bottom-right',
+      width: '550px',
+      height:'300px'
+    });
+    Map.add(chart);
+    
+    // Create a label on the map.
+    var label = ui.Label('Click a point on the chart to show the image for that date.');
+    Map.add(label);
+
+    // SSC legend
+    var ssc_legend = ui.Panel({
+      style: {
+      position: 'bottom-left',
+      padding: '8px 10px'}});
+       
+      // SSC legend title
+    var ssc_legendTitle = ui.Label({
+      value: 'SSC (mg/L)',
+      style: {
+      fontWeight: 'bold',
+      fontSize: '18px',
+      margin: '0 0 4px 0',
+      padding: '0'}});
+    ssc_legend.add(ssc_legendTitle);
+       
+      // create text on top of SSC legend for max value
+    var max_ssc = ui.Panel({
+      widgets: [
+      ui.Label('Max SSC')],});
+    ssc_legend.add(max_ssc);
+    
+    // Create gradient 
+    var viz={min: 0, max:1000, 
+    palette: ['042333','2c3395','744992','b15f82','eb7958','fbb43d','e8fa5b']}
+    var lon = ee.Image.pixelLonLat().select('latitude');
+    var gradient = lon.multiply((viz.max-viz.min)/100.0).add(viz.min);
+    var ssc_legendImage = gradient.visualize(viz);
+       
+    // create gradient thumbnail from the image
+    var thumbnail = ui.Thumbnail({
+      image: ssc_legendImage,
+      params: {bbox:'0,0,10,100', dimensions:'10x200'},
+      style: {padding: '1px', position: 'bottom-center'}
+      });
+    ssc_legend.add(thumbnail);
+     
+    // create text on bottom of legend for min value
+    var min_ssc = ui.Panel({
+    widgets: [ui.Label('0')],});
+     
+    ssc_legend.add(min_ssc);
+    Map.add(ssc_legend);
+  
+    //Add Soil Legend
+    // set position of panel
+    var soil_legend = ui.Panel({
+      style: {
+        position: 'bottom-left',
+        padding: '8px 15px'}});
+    
+    // Create legend title
+    var soil_legendTitle = ui.Label({
+      value: 'Soil Texture',
+      style: {
+        fontWeight: 'bold',
+        fontSize: '18px',
+        margin: '0 0 4px 0',
+        padding: '0'
+        }
+    });
+    
+    // Add the title to the panel
+    soil_legend.add(soil_legendTitle);
+        
+    // Creates and styles 1 row of the legend.
+    var makeRow = function(color, name) {
+          
+          // Create the label that is actually the colored box.
+          var colorBox = ui.Label({
+            style: {
+              backgroundColor: '#' + color,
+              // Use padding to give the box height and width.
+              padding: '8px',
+              margin: '0 0 4px 0'
+            }
+          });
+          
+          // Create the label filled with the description text.
+          var description = ui.Label({
+            value: name,
+            style: {margin: '0 0 4px 6px'}
+          });
+          
+          // return the panel
+          return ui.Panel({
+            widgets: [colorBox, description],
+            layout: ui.Panel.Layout.Flow('horizontal')
+          });
+    };
+    
+    // Add color and and names
+    for (var i = 0; i < 11; i++) {
+      soil_legend.add(makeRow(soil_palette[i], soil_names[i]));
+    }  
+    
+    // Add a button to hide the Panel.
+    soil_legend.add(ui.Button({
+      label: 'Close',
+      onClick: function() {
+        soil_legend.style().set('shown', false);
+      }
+    }));
+    
+    // add legend to map (alternatively you can also print the legend to the console)  
+    Map.add(soil_legend); 
+    
+    // Create an inspector panel with a horizontal layout.
+    var inspector = ui.Panel({
+      layout: ui.Panel.Layout.flow('horizontal')});
+      // Add a label to the panel.
+    Map.add(inspector) 
+        
+    // When the chart is clicked, update the map and label.
+    chart.onClick(function(xValue, yValue, seriesName) {
+      if (!xValue) return;  // Selection was cleared.
+      // Show the terrain  image for the clicked date.
+      var start = ee.Date(xValue).advance(ee.Number(-1),'day');
+      var end = ee.Date(xValue).advance(ee.Number(1),'day');
+      var image =satImgs.filterDate(start, end).qualityMosaic('pixel_qa');
+      var natural_image = satTerrain.filterDate(start, end).qualityMosaic('pixel_qa');
+      var terrainLayer = ui.Map.Layer(natural_image, {
+        bands: ['red','green','blue'],
+        max: 0.2,
+        min: 0}, 'Terrain'); // terrain
+      Map.layers().reset([terrainLayer]);
+      
+       // Add soil layer and legend
+      Map.addLayer(soil_layer, {min:1, max:12, palette: soil_palette}, 'Soil texture', false);
+      
+      // Reset the pixel inspector
+      Map.unlisten(pixel_ssc)
+      
+      // Update SSC legned
+      ssc_legend.remove(max_ssc)
+      ssc_legend.remove(thumbnail)
+      ssc_legend.remove(min_ssc)
+      var scale_max=yValue*2.1
+      var viz={min: 0, max:scale_max, 
+        palette: ['042333','2c3395','744992','b15f82','eb7958','fbb43d','e8fa5b']}
+  
+      max_ssc = ui.Panel({
+        widgets: [
+        ui.Label(Math.round(scale_max))],});
+      ssc_legend.add(max_ssc)
+      ssc_legend.add(thumbnail)
+      ssc_legend.add(min_ssc)
+      
+      // Add SSC map
+      var I=image.clip(study_area)  
+      Map.addLayer(I.select('ssc'), viz,'SSC')
+      
+      // Show a label with the date on the map.
+      label.setValue(new Date(xValue).toLocaleString('bn-BD'));
+      //label.setValue((new Date(xValue)).toUTCString());
+      
+      // Inspector
+      inspector.clear()
+      inspector.add(ui.Label('Click to get surface SSC at a point (may need to click "Esc" key first)'))
+      Map.style().set('cursor', 'crosshair');
+      
+      var pixel_ssc=Map.onClick(function(coords) {
+        // Clear the panel and show a loading message.
+        inspector.clear();
+        inspector.style().set('shown', true);
+        inspector.add(ui.Label('Loading...', {color: 'gray'}));
+      
+        // Compute the SSC
+        var point = ee.Geometry.Point(coords.lon, coords.lat);
+        var sampledPoint = I.select('ssc').reduceRegion(ee.Reducer.mean(), point, 30);
+        var computedValue = sampledPoint.get('ssc');
+      
+        // Request the value from the server and use the results in a function.
+        computedValue.evaluate(function(result) {
+          inspector.clear();
+      
+          // Add a label with the results from the server.
+          inspector.add(ui.Label({
+            value: 'SSC of pixel: ' + result.toFixed(1),
+            style: {stretch: 'vertical'}
+          }));
+      
+          // // Add a button to hide the Panel.
+          // inspector.add(ui.Button({
+          //   label: 'Close',
+          //   onClick: function() {
+          //     inspector.style().set('shown', false);}}));
+        }); // inspector
+      }); // on click
+  
+      }); // before
+      
+      print(chart.getChartType());
+    }
+
+    PlotSSCTimeSeries(combine, combine_ROI, combine_nat, ROI)};
+
+  if (var_option=='reflectance (red/blue/green/NIR)'){
+    if (sat_option=='Landsat 8'){
+    var L8imgs = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR') // get all images in the date range and areas
+      .filterDate(start, end)
+      .filterBounds(study_area);
+    L8imgs = L8imgs.map(Roundtime);
+    L8imgs=L8imgs.select(['B2', 'B3','B4','B5','B6','B7','pixel_qa'],
+      ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+    L8imgs = L8imgs.map(Convert_scale);
+    L8imgs = L8imgs.map(calcArea);
+    L8imgs = L8imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+    L8imgs = L8imgs.map(getCloudsL8);
+    L8imgs=L8imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+    var L8natural = L8imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+    L8imgs = L8imgs.map(maskClouds);
+    L8imgs = L8imgs.map(calcIndex);
+    L8imgs = L8imgs.map(WaterTests);
+    L8imgs = L8imgs.map(maskLand);
+    //L8imgs = L8imgs.map(calc_watercloud_ratio);
+    L8imgs = L8imgs.map(calcCloudAreaRatio);
+    L8imgs = L8imgs.map(AvgBrightness);
+    L8imgs = L8imgs.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+      .filter(ee.Filter.gt('water_pixels',0));
+    L8imgs = L8imgs.map(AvgRED);L8imgs = L8imgs.map(AvgGRN); L8imgs = L8imgs.map(AvgBLU); L8imgs = L8imgs.map(AvgNIR);
+    L8imgs = L8imgs.map(Satellite_ID_8)
+    var combine=L8imgs; var combine_nat=L8natural;}
+
+    else if (sat_option=='Sentinel 2'){
+      var S2imgs = ee.ImageCollection('COPERNICUS/S2_SR') // get all images in the date range and areas
+      .filterDate(start, end)
+      .filterBounds(study_area);
+      S2imgs = S2imgs.map(Roundtime)
+      S2imgs= S2imgs.select(['B2', 'B3','B4','B5','B6','B7','QA60'],
+        ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+      S2imgs = S2imgs.map(Convert_scaleS2);
+      S2imgs = S2imgs.map(calcArea);
+      S2imgs = S2imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+      S2imgs = S2imgs.map(getCloudsS2);
+      S2imgs=S2imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+      var S2natural = S2imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+      S2imgs = S2imgs.map(maskClouds);
+      S2imgs = S2imgs.map(calcIndex);
+      S2imgs = S2imgs.map(WaterTests);
+      S2imgs = S2imgs.map(maskLand);
+      S2imgs = S2imgs.map(calcCloudAreaRatio);
+      S2imgs = S2imgs.map(AvgBrightness);
+      S2imgs = S2imgs.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+        .filter(ee.Filter.gt('water_pixels',0));
+      S2imgs = S2imgs.map(AvgRED);S2imgs = S2imgs.map(AvgGRN); S2imgs = S2imgs.map(AvgBLU); S2imgs = S2imgs.map(AvgNIR);
+      S2imgs = S2imgs.map(Satellite_ID_2)
+      var combine=S2imgs; var combine_nat=S2natural;}
+    
+    else if (sat_option=='Landsat 5 & 7'){
+      var L7imgs = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+        .filterDate(start, end)
+        .filterBounds(study_area);
+      L7imgs = L7imgs.map(Roundtime);
+      L7imgs=L7imgs.select(['B1', 'B2', 'B3','B4','B5','B7', 'sr_cloud_qa','pixel_qa'],
+        ['blue', 'green', 'red', 'nir', 'swir1','swir2', 'sr_cloud_qa','pixel_qa']);
+      L7imgs = L7imgs.map(Convert_scale);
+      L7imgs = L7imgs.map(etm2oli);
+      L7imgs = L7imgs.map(calcArea);
+      L7imgs = L7imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+      L7imgs = L7imgs.map(getCloudsL5L7);
+      L7imgs=L7imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'sr_cloud_qa','pixel_qa']);
+      var L7natural = L7imgs.select(['nir','red','green','blue', 'pixel_qa']);  
+      L7imgs = L7imgs.map(maskClouds);
+      L7imgs = L7imgs.map(calcIndex);
+      L7imgs = L7imgs.map(WaterTests);
+      L7imgs = L7imgs.map(maskLand);
+      L7imgs = L7imgs.map(calc_watercloud_ratio);
+      L7imgs = L7imgs.map(calcCloudAreaRatio);
+      L7imgs = L7imgs.map(AvgBrightness);
+      L7imgs = L7imgs.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh)) 
+        .filter(ee.Filter.gt('water_pixels',0))
+      L7imgs = L7imgs.map(AvgRED);L7imgs = L7imgs.map(AvgGRN);L7imgs = L7imgs.map(AvgBLU);L7imgs = L7imgs.map(AvgNIR);
+      L7imgs=L7imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+      L7imgs = L7imgs.map(Satellite_ID_7);
+      
+      // Landsat 5
+      var L5imgs = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+        .filterDate(start, end)
+        .filterBounds(study_area);
+      L5imgs = L5imgs.map(Roundtime);
+      L5imgs=L5imgs.select(['B1', 'B2', 'B3','B4','B5','B7', 'sr_cloud_qa','pixel_qa'],
+        ['blue', 'green', 'red', 'nir', 'swir1','swir2', 'sr_cloud_qa','pixel_qa']);
+      L5imgs = L5imgs.map(Convert_scale);
+      L5imgs = L5imgs.map(etm2oli);
+      L5imgs = L5imgs.map(calcArea);
+      L5imgs = L5imgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+      L5imgs = L5imgs.map(getCloudsL5L7);
+      var L5natural = L5imgs.select(['nir','red','green','blue', 'pixel_qa']); 
+      L5imgs=L5imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+      L5imgs = L5imgs.map(maskClouds);
+      L5imgs = L5imgs.map(calcIndex);
+      L5imgs = L5imgs.map(WaterTests);
+      L5imgs = L5imgs.map(maskLand);
+      L5imgs = L5imgs.map(calc_watercloud_ratio);
+      L5imgs = L5imgs.map(calcCloudAreaRatio);
+      L5imgs = L5imgs.map(AvgBrightness);
+      L5imgs=L5imgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2', 'clear_mask', 'pixel_qa']);
+      L5imgs = L5imgs.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh))
+        .filter(ee.Filter.gt('water_pixels',0))
+      L5imgs = L5imgs.map(AvgRED); L5imgs = L5imgs.map(AvgGRN);
+      L5imgs = L5imgs.map(AvgBLU);L5imgs = L5imgs.map(AvgNIR);
+      L5imgs = L5imgs.map(Satellite_ID_5);
+      
+      var combine=L7imgs.merge(L5imgs);
+      var combine_nat=L7natural.merge(L5natural);
+      } // if sat option is 5 and 7
+      
+    else if (sat_option=='MODIS'){
+    var MODimgs = ee.ImageCollection('MODIS/006/MOD09GA')
+      .filterDate(start, end)
+      .filterBounds(study_area);
+    MODimgs=MODimgs.map(Roundtime)
+    MODimgs=MODimgs.select(['sur_refl_b03', 'sur_refl_b04','sur_refl_b01','sur_refl_b02','sur_refl_b06','sur_refl_b07','state_1km'],
+      ['blue', 'green', 'red', 'nir', 'swir1','swir2','pixel_qa']);
+    MODimgs = MODimgs.map(Convert_scale);
+    MODimgs = MODimgs.map(calcArea);
+    MODimgs = MODimgs.filter(ee.Filter.gt('ROI_area',ee.Number(ROI.area()).multiply(0.9)));
+    MODimgs = MODimgs.map(getCloudsM);
+    MODimgs = MODimgs.select(['blue', 'green', 'red', 'nir', 'swir1','swir2','state_1km','clear_mask']);
+    var MODimgs_nat = MODimgs.select(['red','nir','blue','green','pixel_qa']);  
+    MODimgs = MODimgs.map(maskClouds);
+    MODimgs = MODimgs.map(calcIndexM);
+    MODimgs = MODimgs.map(WaterTestsM);
+    MODimgs = MODimgs.map(maskLand);
+    MODimgs = MODimgs.map(calc_watercloud_ratio);
+    MODimgs = MODimgs.map(calcCloudAreaRatio);
+    MODimgs = MODimgs.filter(ee.Filter.gt('CloudAreaRatio',cloud_thresh))
+      .filter(ee.Filter.gt('water_pixels',0))
+    MODimgs = MODimgs.map(AvgRED);
+    MODimgs = MODimgs.map(AvgGRN);
+    MODimgs = MODimgs.map(AvgNIR);
+    MODimgs = MODimgs.map(AvgBLU);
+    var combine=MODimgs; var combine_nat=MODimgs_nat;
+    }; // if sat option MODIS
+
+    combine=combine.sort('system:time_start');
+    combine_nat=combine_nat.sort('system:time_start')
+    
+    var PlotReflectanceTimeSeries= function (satImgs, satTerrain, ROI){
+  //****Plot Timeseries*********************************************************************
+    var time = satImgs.aggregate_array('system:time_start');
+    var AverageNIR = ee.Array(satImgs.aggregate_array('avgNIR'));
+    var AverageRED = ee.Array(satImgs.aggregate_array('avgRED'));
+    var AverageGRN = ee.Array(satImgs.aggregate_array('avgGRN'));
+    var AverageBLU = ee.Array(satImgs.aggregate_array('avgBLU'));
+    var SatelliteID = ee.Array(satImgs.aggregate_array('Satellite_ID'));
+    var Yvars = ee.Array.cat([AverageBLU, AverageRED, AverageNIR, AverageGRN, SatelliteID], 1);
+    
+    // Create an image time series chart.
+    var chart = ui.Chart.array.values(Yvars,0,time)
+      .setSeriesNames(['Blue','Red','NIR','Green','SatID'])
+      .setOptions({
+        title: 'Reflectance',
+        hAxis: {'title': 'Date'},
+        vAxis: {'title': 'Reflectance',
+        'viewWindow': {'max':0.3}},
+        legend: {position: 'top'},
+        pointSize: 4,
+        lineWidth: 1
+      })
+    
+    // Add the chart to the map.
+    chart.style().set({
+      position: 'bottom-right',
+      width: '700px',
+      height:'300px'
+    });
+    Map.add(chart);
+    
+
+    // Create a label on the map.
+    var label = ui.Label('Click a point on the chart to show the image for that date.');
+    Map.add(label);
+ 
+    //Add Soil Legend
+    // set position of panel
+    var soil_legend = ui.Panel({
+      style: {
+        position: 'bottom-left',
+        padding: '8px 15px'}});
+    
+    // Create legend title
+    var soil_legendTitle = ui.Label({
+      value: 'Soil Texture',
+      style: {
+        fontWeight: 'bold',
+        fontSize: '18px',
+        margin: '0 0 4px 0',
+        padding: '0'
+        }
+    });
+    
+    // Add the title to the panel
+    soil_legend.add(soil_legendTitle);
+        
+    // Creates and styles 1 row of the legend.
+    var makeRow = function(color, name) {
+          
+          // Create the label that is actually the colored box.
+          var colorBox = ui.Label({
+            style: {
+              backgroundColor: '#' + color,
+              // Use padding to give the box height and width.
+              padding: '8px',
+              margin: '0 0 4px 0'
+            }
+          });
+          
+          // Create the label filled with the description text.
+          var description = ui.Label({
+            value: name,
+            style: {margin: '0 0 4px 6px'}
+          });
+          
+          // return the panel
+          return ui.Panel({
+            widgets: [colorBox, description],
+            layout: ui.Panel.Layout.Flow('horizontal')
+          });
+    };
+    
+    // Add color and and names
+    for (var i = 0; i < 11; i++) {
+      soil_legend.add(makeRow(soil_palette[i], soil_names[i]));
+    }  
+    
+    // Add a button to hide the Panel.
+    soil_legend.add(ui.Button({
+      label: 'Close',
+      onClick: function() {
+        soil_legend.style().set('shown', false);
+      }
+    }));
+    
+    // add legend to map (alternatively you can also print the legend to the console)  
+    Map.add(soil_legend); 
+    
+    
+    var inspector = ui.Panel({
+      layout: ui.Panel.Layout.flow('horizontal')});
+    Map.add(inspector);
+
+    // When the chart is clicked, update the map and label.
+    chart.onClick(function(xValue, yValue, seriesName) {
+      if (!xValue) return;  // Selection was cleared.
+   
+      // Show the image for the clicked date.
+      var equalDate = ee.Filter.equals('system:time_start', xValue);
+      var start = ee.Date(xValue).advance(ee.Number(-1),'day');
+      var end = ee.Date(xValue).advance(ee.Number(1),'day');
+      var natural_image = satTerrain.filterDate(start, end).qualityMosaic('pixel_qa');      
+      var terrainLayer = ui.Map.Layer(natural_image, {
+        bands: ['red','green','blue'],
+        max: 0.20,
+        min: 0
+      }, 'Terrain');
+      Map.layers().reset([terrainLayer]);
+  
+       // Add soil layer and legend
+      Map.addLayer(soil_layer, {min:1, max:12, palette: soil_palette}, 'Soil texture', false);      
+
+      // Reset the pixel inspector
+      Map.unlisten(pixel_reflectance)
+      
+      var red_image =satImgs.filterDate(start, end).qualityMosaic('pixel_qa').select('red').clip(study_area);
+      Map.addLayer(red_image, {min:0.02, max:0.08, palette: ['FFFFFF','FF0000']},'Red', true);
+      var blue_image =satImgs.filterDate(start, end).qualityMosaic('pixel_qa').select('blue').clip(study_area);
+      Map.addLayer(blue_image, {min:0.02, max:0.08, palette: ['FFFFFF','0000FF']}, 'Blue', false);
+      var green_image =satImgs.filterDate(start, end).qualityMosaic('pixel_qa').select('green').clip(study_area);
+      Map.addLayer(green_image, {min:0.02, max:0.08, palette: ['FFFFFF','00FF00']}, 'Green', false);
+      var nir_image =satImgs.filterDate(start, end).qualityMosaic('pixel_qa').select('nir').clip(study_area);
+      Map.addLayer(nir_image, {min:0.02, max:0.08, palette: ['FFFFFF','FFFF00']}, 'NIR', false);
+      // Show a label with the date on the map.
+      label.setValue(new Date(xValue).toLocaleString('bn-BD'));
+
+      // Inspector
+      inspector.clear();
+      inspector.add(ui.Label('Click to get surface reflectance at a point (may need to click ESC first)'));
+      
+      // Set the default map's cursor to a "crosshair".
+      Map.style().set('cursor', 'crosshair');
+      
+      var pixel_reflectance=Map.onClick(function(coords) {
+          // Clear the panel and show a loading message.
+          inspector.clear();
+          inspector.style().set('shown', true);
+          inspector.add(ui.Label('Loading...', {color: 'gray'}));
+        
+          // Compute the mean NDVI; a potentially long-running server operation.
+          var point = ee.Geometry.Point(coords.lon, coords.lat);
+          //var temporalMean = ndvi.reduce(ee.Reducer.mean());
+          var sampledPointRed = red_image.select('red').reduceRegion(ee.Reducer.mean(), point, 30);
+          var computedValueRed = sampledPointRed.get('red');
+          var sampledPointBlue = blue_image.select('blue').reduceRegion(ee.Reducer.mean(), point, 30);
+          var computedValueBlue = sampledPointBlue.get('blue');
+          var sampledPointGreen = green_image.select('green').reduceRegion(ee.Reducer.mean(), point, 30);
+          var computedValueGreen = sampledPointGreen.get('green');
+          var sampledPointNIR = nir_image.select('nir').reduceRegion(ee.Reducer.mean(), point, 30);
+          var computedValueNIR = sampledPointNIR.get('nir');
+          
+          var computed_values_ref=ee.Array([computedValueRed, computedValueBlue, computedValueGreen, computedValueNIR])
+        
+          // Request the value from the server and use the results in a function.
+          computed_values_ref.evaluate(function(result) {
+            inspector.clear();
+        
+            // Add a label with the results from the server.
+            inspector.add(ui.Label({
+              value: 'red: ' + result[0].toFixed(3) +', blue: ' + result[1].toFixed(3) +
+              ', green: ' + result[2].toFixed(3)+ ', nir: ' + result[3].toFixed(3),
+              style: {stretch: 'vertical'}
+            }));
+        
+            // // Add a button to hide the Panel.
+            // inspector.add(ui.Button({
+            //   label: 'Close',
+            //   onClick: function() {
+            //     inspector.style().set('shown', false);}}));
+                
+          }); // inspector
+        }); // on click
+
+
+    });
+    
+    print(chart.getChartType())
+    }
+    PlotReflectanceTimeSeries(combine, combine_nat, ROI)
+
+  } // if var is rgbn
+
+} // filter_images
+
+// The namespace for our application.  All the state is kept in here.
+var app = {};
+
+app.addPolygon=function(){
+  // Don't make imports that correspond to the drawn points.
+  Map.drawingTools().setLinked(false);
+  // Limit the draw modes to polygon
+  Map.drawingTools().setDrawModes(['polygon']);
+  // Add an empty layer to hold the drawn points.
+  Map.drawingTools().addLayer([]);
+  // Set the geometry type to be polygon
+  Map.drawingTools().setShape('polygon');
+  // Enter drawing mode.
+  Map.drawingTools().draw();  
+}
+
+
+/** Creates the UI panels. */
+app.createPanels = function() {
+  /* The introduction section. */
+  app.intro = {
+    panel: ui.Panel([
+      ui.Label({
+        value: 'BROSS',
+        style: {fontWeight: 'bold', fontSize: '18px', margin: '2px 0px -4px 8px'}
+      }),
+      ui.Label('Bangladesh Remote Sensing of Suspended Sediment'),
+      ui.Label('Developed for the Bangladesh Water Development Board by University of Washington SASWE Research Group'),
+      ui.Label({
+        value:"Click here for User Manual",
+        style: {margin: '0px 0px 0px 8px'},
+        targetUrl:"https://github.com/cbev/bross/blob/master/manual_user_GEE.pdf"})
+      ])};
+
+  /* The collection filter controls. */
+  app.filters = {
+    //polygon: polygon,
+    startDate: ui.Textbox('YYYY-MM-DD', '2018-01-01'),//'1984-01-01'),
+    endDate: ui.Textbox('YYYY-MM-DD', '2020-12-31'),// '2020-12-31'),
+    satellites: ui.Select({items:
+      ['Sentinel 2', 'Landsat 8', 'Landsat 5 & 7','MODIS'], placeholder: 'Select option'}),
+    variables: ui.Select({items:
+    ['suspended sediment concentration (SSC)',
+    'reflectance (red/blue/green/NIR)'], placeholder: 'Select option'}),
+  };
+
+  /* The panel for the filter control widgets. */
+  app.filters.panel = ui.Panel({
+    widgets: [
+      ui.Label('1) Set up filters', {fontWeight: 'bold'}),
+      ui.Label('a. Sketch region of interest (ROI)', {fontWeight: 'bold'}),
+      ui.Label('The average SSC or reflectance will be computed for this ROI over the time period specified', app.HELPER_TEXT_STYLE_2),
+      ui.Label('b. Input date range', {fontWeight: 'bold'}),
+      ui.Label('Start date (YYYY-MM-DD)', app.HELPER_TEXT_STYLE_1),
+      app.filters.startDate,
+      ui.Label('End date (YYYY-MM-DD)', app.HELPER_TEXT_STYLE_1),
+      app.filters.endDate,
+      ui.Label('c. Select satellite(s)', {fontWeight: 'bold'}),
+      ui.Label('Sentinel-2: 10 m, 10 day, Dec 2018-present', app.HELPER_TEXT_STYLE_3),
+      ui.Label('Landsat 8: 30 m, 16 day, Feb 2013-present', app.HELPER_TEXT_STYLE_3),
+      ui.Label('Landsat 5 & 7: 30 m, 16 day, Jan 1984-May 2012', app.HELPER_TEXT_STYLE_3),
+      ui.Label('MODIS: 500 m, 1 day, Feb 2000-present', app.HELPER_TEXT_STYLE_3),
+      app.filters.satellites,
+      ui.Label('4) Select time series/mapping option', {fontWeight: 'bold'}),
+      app.filters.variables,
+      ],
+      style: app.SECTION_STYLE});
+
+/* The button to apply filters */
+  app.applyfilter={
+    button: ui.Button({
+      label:'Display series',
+      onClick: function (){
+        // Set date filter
+        Map.clear();
+        var ROI=Map.drawingTools().layers().get(0).toGeometry()
+        var start = app.filters.startDate.getValue();
+        if (start) start = ee.Date(start);
+        var end = app.filters.endDate.getValue();
+        if (end) end = ee.Date(end);
+        var sat_option=app.filters.satellites.getValue()
+        var var_option=app.filters.variables.getValue()
+        filter_images(start, end, ROI, sat_option, var_option)
+      }
+    })
+  }  
+  
+  app.applyfilter.panel=ui.Panel({
+    widgets: [
+      ui.Label('2) Display interactive time series with mapped SSC or reflectance', {fontWeight: 'bold'}),
+      app.applyfilter.button,
+      ui.Label('Click a point on the time series to display mapped data for that date. Then, click on a pixel to get pixel value (may need to first click "Esc" key).', app.HELPER_TEXT_STYLE_2),
+      ui.Label('3) (Optional) Export time series data by clicking top right corner of time series plot', 
+      {fontWeight: 'bold'}),
+      ui.Label('4) (Optional) Produce SSC time series for the ROI using ANN', 
+      {fontWeight: 'bold'}),
+      ui.Label({
+        value:"Click here for Notebook ",
+        style:{
+          margin: '0px 0 0px 8px', fontSize: '14px', color: 'gray'},
+        targetUrl:"https://colab.research.google.com/drive/1xR-YsvHcMfTR-HOhXeUWskIM3wQIqE2a"}),
+      ui.Label({
+        value:"Acknowledgements",
+        style:{
+          margin: '12px 0 0px 8px', fontSize: '12px', color: 'gray'},
+        targetUrl:"http://depts.washington.edu/saswe/bross/acknowledgement.html"}),
+      ui.Label({
+        value:"How to Cite",
+        style:{
+          margin: '12px 0 0px 8px', fontSize: '12px', color: 'gray'},
+        targetUrl:"http://depts.washington.edu/saswe/bross/cite.html"})
+      ],
+      style: app.SECTION_STYLE});
+  
+}
+
+/** Creates the app constants. margin is top right bottom left */ 
+app.createConstants = function() {
+  app.SECTION_STYLE = {margin: '10px 0 0 0'};
+  app.HELPER_TEXT_STYLE_1 = {
+      margin: '8px 0 -3px 8px',
+      fontSize: '12px',
+      color: 'gray'};
+  app.HELPER_TEXT_STYLE_2 = {
+      margin: '0px 0 -1px 8px',
+      fontSize: '12px',
+      color: 'gray'};
+  app.HELPER_TEXT_STYLE_3 = {
+      margin: '0px 0 2px 8px',
+      fontSize: '12px',      
+      color: 'gray'};};
+
+/** Creates the application interface. */
+app.boot = function() {
+  app.addPolygon();
+  app.createConstants();
+  app.createPanels();
+  var main = ui.Panel({
+    widgets: [
+      app.intro.panel,
+      app.filters.panel,
+      app.applyfilter.panel,
+    ],
+    style: {width: '320px', padding: '8px'}
+  });
+  //Map.centerObject(polygon, 10);
+  ui.root.insert(0, main);
+};
+app.boot();
