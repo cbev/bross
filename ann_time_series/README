@@ -1,0 +1,4 @@
+ann_L5L7.h5 is ANN model for Landsat 5 & Landsat 7 data
+ann_L8S2.h5 is ANN model for Landsat 8 data
+ann_M.h5 is ANN model for MODIS data
+scale_matrix.pkl is matrix to scale satellite inputs for model. contains: L5L7_mean, L5L7_std, L8_mean, L8_std, M_mean, M_std
