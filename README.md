@@ -1,11 +1,10 @@
 # bross
-Links to applications:  <br/> 
+**Links to applications:**  <br/> 
 GEE: https://bross.users.earthengine.app/view/gee  <br/> 
 Local server: http://depts.washington.edu/saswe/bross/ <br/> 
 <br/> 
 <br/> 
-Description of files:<br/> 
-<br/> 
+**Description of files:**<br/> 
 ann_time_series: Folder that duplicates the files to create ANN time series from GEE outputs<br/> 
 Calibrate_ANN_Landsat5Landsat7.ipynb: Script to calibrate Landsat 5 & 7 ANN models<br/> 
 Calibrate_ANN_Landsat8Sentinel2.ipynb: Script to calibrate Landsat 8 & Sentinel-2 ANN models<br/> 
