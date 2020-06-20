@@ -1,3 +1,5 @@
+This is a duplicate of the repository: https://github.com/cbev/BROSS_ann_notebook
+
 ann_L5L7.h5 is ANN model for Landsat 5 & Landsat 7 data
 ann_L8S2.h5 is ANN model for Landsat 8 data
 ann_M.h5 is ANN model for MODIS data
